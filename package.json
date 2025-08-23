@@ -1,15 +1,19 @@
 {
   "name": "surgerywhisper-api",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "1.1.0",
   "type": "commonjs",
+  "main": "index.js",
   "license": "MIT",
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "openai": "^4.52.0",
+    "pdf-parse": "^1.1.1",
+    "pg": "^8.11.5"
   }
 }
