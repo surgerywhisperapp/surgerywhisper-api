@@ -11,7 +11,7 @@ async function embedOne(text) {
 }
 
 // batch with simple concurrency
-async function embedMany(texts, concurrency = 4) {
+async function embedMany(texts, concurrency = 1) {
   const out = new Array(texts.length);
   let i = 0;
   async function worker() {
