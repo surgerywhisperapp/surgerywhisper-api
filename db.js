@@ -1,70 +1,132 @@
+// db.js
 const { Pool } = require('pg');
+const { parse } = require('pg-connection-string');
+const dns = require('dns');
+const { embedOne } = require('./embed'); // used by vectorSearch
 
+// --- Parse connection string from env ---
+const cfg = parse(process.env.SUPABASE_DB_URL || '');
+
+// --- Create Pool (force IPv4 lookups to avoid ENETUNREACH) ---
 const pool = new Pool({
-  connectionString: process.env.SUPABASE_DB_URL,
-  ssl: { rejectUnauthorized: false }
+  ...cfg,
+  ssl: { rejectUnauthorized: false },
+  lookup: (hostname, options, cb) => dns.lookup(hostname, { ...options, family: 4 }, cb),
+  keepAlive: true,
+  allowExitOnIdle: true,
 });
 
+// --- Tiny tagged template helper: builds $1, $2 placeholders safely ---
 async function sql(strings, ...values) {
-  const text = strings.reduce((a, s, i) => a + s + (values[i] !== undefined ? `$${i+1}` : ''), '');
+  const text = strings.reduce(
+    (acc, s, i) => acc + s + (i < values.length ? `$${i + 1}` : ''),
+    ''
+  );
   const res = await pool.query(text, values);
   return res.rows;
 }
 
-async function insertDocument({ title, pages }) {
-  const { rows } = await pool.query(
-    'insert into documents(title, pages) values ($1,$2) returning id',
-    [title, pages || null]
-  );
+// --- pgvector literal formatter: [0.1,-0.2,...] ---
+function toVectorLiteral(arr) {
+  // ensure numeric and join with commas (no spaces)
+  return '[' + arr.map((x) => (typeof x === 'number' ? x : Number(x))).join(',') + ']';
+}
+
+/**
+ * Insert a document record.
+ * @param {string} title
+ * @param {number|null} pages
+ * @returns {Promise<string>} document id (uuid)
+ */
+async function insertDocument(title, pages = null) {
+  const rows = await sql/*sql*/`
+    INSERT INTO documents (title, pages)
+    VALUES (${title}, ${pages})
+    RETURNING id
+  `;
   return rows[0].id;
 }
 
-async function insertChunks(docId, rows) {
-  // rows: [{ content, snippet, page_from, page_to, embedding }]
-  const client = await pool.connect();
-  try {
-    await client.query('begin');
-    for (const r of rows) {
-      await client.query(
-        'insert into chunks(document_id, content, snippet, page_from, page_to, embedding) values ($1,$2,$3,$4,$5,$6)',
-        [docId, r.content, r.snippet || null, r.page_from || null, r.page_to || null, r.embedding]
-      );
-    }
-    await client.query('commit');
-  } catch (e) {
-    await client.query('rollback');
-    throw e;
-  } finally {
-    client.release();
+/**
+ * Insert chunk rows with embeddings.
+ * rows: [{ content, snippet, page_from, page_to, embedding:number[] }, ...]
+ */
+async function insertChunks(documentId, rows) {
+  for (const r of rows) {
+    const vec = toVectorLiteral(r.embedding);
+    await sql/*sql*/`
+      INSERT INTO chunks (document_id, content, snippet, page_from, page_to, embedding)
+      VALUES (
+        ${documentId},
+        ${r.content},
+        ${r.snippet},
+        ${r.page_from},
+        ${r.page_to},
+        ${vec}::vector(1536)
+      )
+    `;
   }
 }
 
-async function vectorSearch(qVec, topK = 6) {
-  const { rows } = await pool.query(
-    `select document_id, content, snippet, page_from, page_to
-     from chunks
-     order by embedding <-> $1
-     limit $2`,
-    [qVec, topK]
-  );
+/**
+ * Vector search topK chunks for a natural-language query.
+ * Returns rows with: doc_id, title, page_from, page_to, snippet, content
+ */
+async function vectorSearch(query, topK = 6) {
+  const qEmb = await embedOne(query);        // number[]
+  const qVec = toVectorLiteral(qEmb);        // "[...]"
+  const rows = await sql/*sql*/`
+    SELECT d.id AS doc_id,
+           d.title,
+           c.page_from,
+           c.page_to,
+           c.snippet,
+           c.content
+    FROM chunks c
+    JOIN documents d ON d.id = c.document_id
+    ORDER BY c.embedding <-> ${qVec}::vector(1536)
+    LIMIT ${topK}
+  `;
   return rows;
 }
 
-async function saveFullAnswer(id, full, ttlHours = 24) {
-  await pool.query(
-    `insert into answers(id, full_answer, expires_at)
-     values ($1,$2, now() + make_interval(hours => $3))
-     on conflict (id) do update set full_answer=$2, expires_at=now()+make_interval(hours=>$3)`,
-    [id, full, ttlHours]
-  );
+/**
+ * Cache full answer text for "Show more"
+ * @param {string} id
+ * @param {string} fullText
+ * @param {number} ttlMinutes
+ */
+async function saveFullAnswer(id, fullText, ttlMinutes = 60) {
+  await sql/*sql*/`
+    INSERT INTO answers (id, full_answer, expires_at)
+    VALUES (${id}, ${fullText}, now() + (${ttlMinutes} || ' minutes')::interval)
+    ON CONFLICT (id) DO UPDATE
+    SET full_answer = EXCLUDED.full_answer,
+        expires_at  = EXCLUDED.expires_at
+  `;
 }
 
+/**
+ * Load full answer if not expired
+ * @param {string} id
+ * @returns {Promise<string|null>}
+ */
 async function loadFullAnswer(id) {
-  const { rows } = await pool.query(
-    `select full_answer from answers where id=$1 and expires_at > now()`,
-    [id]
-  );
-  return rows[0]?.full_answer || null;
+  const rows = await sql/*sql*/`
+    SELECT full_answer
+    FROM answers
+    WHERE id = ${id} AND expires_at > now()
+    LIMIT 1
+  `;
+  return rows.length ? rows[0].full_answer : null;
 }
 
-module.exports = { sql, insertDocument, insertChunks, vectorSearch, saveFullAnswer, loadFullAnswer };
+module.exports = {
+  sql,
+  insertDocument,
+  insertChunks,
+  vectorSearch,
+  saveFullAnswer,
+  loadFullAnswer,
+  toVectorLiteral,
+};
